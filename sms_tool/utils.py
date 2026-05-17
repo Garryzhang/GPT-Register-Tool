@@ -27,6 +27,13 @@ def _print_timings():
     print(f"{'TOTAL':<40} {total:>10.2f}")
     print("=" * 50)
 
+def _timing_summary():
+    t = _tl()
+    return {
+        "steps": [{"name": name, "seconds": round(elapsed, 2)} for name, elapsed in t],
+        "total_seconds": round(sum(elapsed for _, elapsed in t), 2),
+    }
+
 
 # ==========================================
 # Random Generators

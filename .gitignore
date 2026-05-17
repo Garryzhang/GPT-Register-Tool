@@ -2,6 +2,10 @@ config.json
 sms_tool/config.json
 outlook_results/
 dist/
+sessions/
+runtime/
+.dotnet/
+sms_tool/sentinel_cache.json
 
 __pycache__/
 *.py[cod]

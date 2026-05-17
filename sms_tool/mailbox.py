@@ -1,20 +1,18 @@
 import argparse
-import json
-import os
 import re
-import subprocess
-import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from curl_cffi import requests as curl_requests
 
 from .config import CFG
+from .providers.luckmail_token import LuckMailTokenClient
 
 # ==========================================
-# Outlook mailbox integration
-# Compatible with nb-register outlook_token.txt:
+# Mailbox integration.
+# Compatible with token files in this format:
 # email---password---refresh_token---access_token---0
 # ==========================================
 @dataclass
@@ -24,6 +22,15 @@ class MailboxAccount:
     refresh_token: str = ""
     access_token: str = ""
     source: str = ""
+    provider: str = "graph"
+    order_no: str = ""
+    token: str = ""
+    seen_message_id: str = ""
+    purchase_id: str = ""
+    project_name: str = ""
+    price: str = ""
+    purchase_total_cost: str = ""
+    balance_after: str = ""
 
 
 OTP_RE = re.compile(r"(^|[^0-9])([0-9]{6})([^0-9]|$)")
@@ -33,14 +40,215 @@ def _email_cfg():
     return CFG.get("email_registration", {})
 
 
+def _luckmail_enabled():
+    return bool((_email_cfg().get("luckmail_api_key") or "").strip())
+
+
+def _otp_poll_interval():
+    try:
+        return max(1.0, float(_email_cfg().get("otp_poll_interval", 2)))
+    except Exception:
+        return 2.0
+
+
+def _luckmail_headers():
+    api_key = (_email_cfg().get("luckmail_api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("email_registration.luckmail_api_key is required")
+    return {"X-API-Key": api_key, "Accept": "application/json", "Content-Type": "application/json"}
+
+
+def _luckmail_url(path):
+    base_url = (_email_cfg().get("luckmail_base_url") or "https://mails.luckyous.com").rstrip("/")
+    return base_url + path
+
+
+def _luckmail_token_client():
+    return LuckMailTokenClient(
+        _email_cfg().get("luckmail_base_url", "https://mails.luckyous.com"),
+        _email_cfg().get("luckmail_api_key", ""),
+        timeout=30,
+        verify_tls=False,
+    )
+
+
+def _luckmail_token_code(mailbox):
+    token = getattr(mailbox, "token", "")
+    if not token:
+        raise RuntimeError("LuckMail purchased mailbox missing token")
+    return _luckmail_token_client().code(token)
+
+
+def _luckmail_token_mails(mailbox):
+    token = getattr(mailbox, "token", "")
+    if not token:
+        raise RuntimeError("LuckMail purchased mailbox missing token")
+    return _luckmail_token_client().mails(token)
+
+
+def _luckmail_token_alive(mailbox):
+    token = getattr(mailbox, "token", "")
+    if not token:
+        raise RuntimeError("LuckMail purchased mailbox missing token")
+    return _luckmail_token_client().alive(token)
+
+
+def _luckmail_token_email(token):
+    if not token:
+        return ""
+    return _luckmail_token_client().resolve_email(token)
+
+
+def _latest_luckmail_message(data):
+    data = data or {}
+    latest = data.get("mail") or data.get("latest_mail") or {}
+    if latest:
+        return latest
+    mails = data.get("mails") or []
+    return mails[0] if isinstance(mails, list) and mails and isinstance(mails[0], dict) else {}
+
+
+def _latest_luckmail_message_id(data):
+    latest = _latest_luckmail_message(data)
+    return str(latest.get("message_id") or latest.get("id") or "").strip()
+
+
+def _snapshot_luckmail_token_message(mailbox):
+    if getattr(mailbox, "provider", "") != "luckmail_token":
+        return ""
+    try:
+        data = (_luckmail_token_code(mailbox).get("data") or {})
+        message_id = _latest_luckmail_message_id(data)
+        if not message_id:
+            data = (_luckmail_token_mails(mailbox).get("data") or {})
+            message_id = _latest_luckmail_message_id(data)
+        mailbox.seen_message_id = message_id
+        return message_id
+    except Exception as e:
+        print(f"[luckmail token snapshot error: {e}]")
+        return ""
+
+
+def _luckmail_request(method, path, **kwargs):
+    method = method.upper()
+    url = _luckmail_url(path)
+    headers = _luckmail_headers()
+    if method == "GET":
+        r = curl_requests.get(url, headers=headers, impersonate="chrome", timeout=30, verify=False, **kwargs)
+    elif method == "POST":
+        r = curl_requests.post(url, headers=headers, impersonate="chrome", timeout=30, verify=False, **kwargs)
+    else:
+        raise ValueError(f"unsupported LuckMail method: {method}")
+    try:
+        body = r.json()
+    except Exception:
+        body = {"raw": r.text[:500]}
+    if r.status_code < 200 or r.status_code >= 300:
+        raise RuntimeError(f"LuckMail HTTP {r.status_code}: {body}")
+    if body.get("code") not in (0, None):
+        raise RuntimeError(f"LuckMail API error: {body}")
+    return body.get("data")
+
+
+def _create_luckmail_order():
+    cfg = _email_cfg()
+    payload = {
+        "project_code": cfg.get("luckmail_project_code", "openai"),
+        "email_type": cfg.get("luckmail_email_type", "self_built"),
+    }
+    for src, dest in (
+        ("luckmail_domain", "domain"),
+        ("luckmail_specified_email", "specified_email"),
+        ("luckmail_variant_mode", "variant_mode"),
+    ):
+        value = str(cfg.get(src, "") or "").strip()
+        if value:
+            payload[dest] = value
+    data = _luckmail_request("POST", "/api/v1/openapi/order/create", json=payload)
+    order_no = str((data or {}).get("order_no") or "").strip()
+    email = str((data or {}).get("email_address") or "").strip().lower()
+    if not order_no or not email:
+        raise RuntimeError(f"LuckMail order/create returned incomplete data: {data}")
+    return MailboxAccount(
+        email=email,
+        source="luckmail",
+        provider="luckmail",
+        order_no=order_no,
+    )
+
+
+def _create_luckmail_purchase(args=None):
+    args = args or argparse.Namespace()
+    cfg = _email_cfg()
+    project_code = (
+        getattr(args, "luckmail_purchase_project", None)
+        or cfg.get("luckmail_purchase_project_code")
+        or cfg.get("luckmail_project_code")
+        or "openai"
+    )
+    email_type = (
+        getattr(args, "luckmail_purchase_email_type", None)
+        or cfg.get("luckmail_purchase_email_type")
+        or "ms_imap"
+    )
+    domain = (
+        getattr(args, "luckmail_purchase_domain", None)
+        or cfg.get("luckmail_purchase_domain")
+        or "outlook.com"
+    )
+    quantity = max(1, int(getattr(args, "count", None) or 1))
+    payload = {
+        "project_code": project_code,
+        "email_type": email_type,
+        "quantity": quantity,
+    }
+    if domain:
+        payload["domain"] = domain
+    print(f"[*] LuckMail purchase: project={project_code} type={email_type} domain={domain or '*'} quantity={quantity}")
+    data = _luckmail_request("POST", "/api/v1/openapi/email/purchase", json=payload)
+    purchases = (data or {}).get("purchases") or []
+    if not purchases:
+        raise RuntimeError(f"LuckMail email/purchase returned no purchases: {data}")
+    accounts = []
+    for item in purchases:
+        email = str(item.get("email_address") or "").strip().lower()
+        token = str(item.get("token") or "").strip()
+        if not email or not token:
+            raise RuntimeError(f"LuckMail purchase item incomplete: {item}")
+        accounts.append(MailboxAccount(
+            email=email,
+            source="luckmail_purchase",
+            provider="luckmail_token",
+            token=token,
+            purchase_id=str(item.get("id") or ""),
+            project_name=str(item.get("project_name") or item.get("project") or ""),
+            price=str(item.get("price") or ""),
+            purchase_total_cost=str((data or {}).get("total_cost") or ""),
+            balance_after=str((data or {}).get("balance_after") or ""),
+        ))
+        print(f"[*] Purchased mailbox: {email} token={token} price={item.get('price')}")
+    if (data or {}).get("balance_after") is not None:
+        print(f"[*] LuckMail balance after purchase: {data.get('balance_after')}")
+    return accounts
+
+
 def _default_nb_register_token_file():
-    path = _email_cfg().get("nb_register_path", r"F:\epsoft\nb-register")
-    return str(Path(path) / "outlook-register-service" / "Results" / "outlook_token.txt")
+    return str(Path.cwd() / "mailbox_tokens.txt")
 
 
 def _mailbox_from_config(args=None):
     args = args or argparse.Namespace()
+    luckmail_token = (
+        getattr(args, "luckmail_token", None)
+        or _email_cfg().get("luckmail_token")
+        or ""
+    ).strip()
     email = (getattr(args, "email", None) or _email_cfg().get("email") or "").strip().lower()
+    if not email and luckmail_token:
+        try:
+            email = _luckmail_token_email(luckmail_token)
+        except Exception as e:
+            print(f"[luckmail token mailbox resolve error: {e}]")
     if not email:
         return None
     return MailboxAccount(
@@ -48,7 +256,9 @@ def _mailbox_from_config(args=None):
         password=(getattr(args, "email_password", None) or _email_cfg().get("password") or "").strip(),
         refresh_token=(getattr(args, "email_refresh_token", None) or _email_cfg().get("refresh_token") or "").strip(),
         access_token=(getattr(args, "email_access_token", None) or _email_cfg().get("access_token") or "").strip(),
-        source="config",
+        source="luckmail_purchase" if luckmail_token else "config",
+        provider="luckmail_token" if luckmail_token else "graph",
+        token=luckmail_token,
     )
 
 
@@ -75,6 +285,7 @@ def _parse_mailbox_token_file(path):
             refresh_token=refresh_token,
             access_token=access_token,
             source=str(token_path),
+            provider="graph",
         ))
     return records
 
@@ -98,12 +309,15 @@ def _parse_mailbox_password_file(path):
             email=email.lower(),
             password=password,
             source=str(password_path),
+            provider="graph",
         ))
     return records
 
 
 def _load_mailbox_pool(args=None):
     args = args or argparse.Namespace()
+    if getattr(args, "buy_luckmail_mailbox", False):
+        return _create_luckmail_purchase(args)
     direct = _mailbox_from_config(args)
     if direct:
         return [direct]
@@ -119,258 +333,16 @@ def _pick_mailbox(index=0, args=None):
     return pool[index % len(pool)]
 
 
-def _outlook_register_cfg():
-    return CFG.get("outlook_register", {})
-
-
-def _default_nb_register_outlook_dir():
-    base = _email_cfg().get("nb_register_path") or _outlook_register_cfg().get("nb_register_path") or r"F:\epsoft\nb-register"
-    return Path(base) / "outlook-register-service"
-
-
-def _outlook_results_dir(args=None):
-    args = args or argparse.Namespace()
-    configured = (
-        getattr(args, "outlook_results_dir", None)
-        or _outlook_register_cfg().get("results_dir")
-        or _email_cfg().get("results_dir")
-    )
-    if configured:
-        return Path(configured).resolve()
-    return (Path(__file__).parent / "outlook_results").resolve()
-
-
-def _outlook_script_path(args=None):
-    args = args or argparse.Namespace()
-    configured = getattr(args, "outlook_script", None) or _outlook_register_cfg().get("script_path")
-    if configured:
-        return Path(configured).resolve()
-    return (_default_nb_register_outlook_dir() / "camoufox_register.py").resolve()
+def _ensure_mailbox_account(mailbox=None):
+    if mailbox:
+        return mailbox
+    if _luckmail_enabled():
+        return _create_luckmail_order()
+    return None
 
 
 def _record_key(record):
     return (record.email or "").strip().lower()
-
-
-def _new_mailbox_records(before, after):
-    before_keys = {_record_key(item) for item in before}
-    return [item for item in after if _record_key(item) and _record_key(item) not in before_keys]
-
-
-def _outlook_env(proxy="", results_dir=None):
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    cfg = _outlook_register_cfg()
-    env_map = {
-        "OUTLOOK_REGISTER_OAUTH_VERIFICATION_CODE": cfg.get("oauth_verification_code", ""),
-        "OUTLOOK_REGISTER_OAUTH_VERIFICATION_CODE_FILE": cfg.get("oauth_verification_code_file", ""),
-        "OUTLOOK_REGISTER_EMAIL_ATTEMPTS": str(cfg.get("email_attempts", "")),
-        "OUTLOOK_REGISTER_BOT_PROTECTION_WAIT": str(cfg.get("bot_protection_wait", "")),
-    }
-    for key, value in env_map.items():
-        if str(value).strip():
-            env[key] = str(value).strip()
-    if results_dir:
-        env["OUTLOOK_REGISTER_RESULTS_DIR"] = str(results_dir)
-    if proxy:
-        env["OUTLOOK_REGISTER_PROXY"] = proxy
-        env["HTTP_PROXY"] = proxy
-        env["HTTPS_PROXY"] = proxy
-        env["http_proxy"] = proxy
-        env["https_proxy"] = proxy
-        env.setdefault("NO_PROXY", "localhost,127.0.0.1")
-        env.setdefault("no_proxy", "localhost,127.0.0.1")
-    return env
-
-
-def _run_outlook_register_once(args=None, proxy=""):
-    args = args or argparse.Namespace()
-    script = _outlook_script_path(args)
-    if not script.exists():
-        raise FileNotFoundError(f"Outlook register script not found: {script}")
-    results_dir = _outlook_results_dir(args)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    unlogged = results_dir / "unlogged_email.txt"
-    before = _parse_mailbox_password_file(unlogged)
-    cfg = _outlook_register_cfg()
-    suffix = getattr(args, "outlook_suffix", None) or cfg.get("email_suffix", "@outlook.com")
-    max_retries = str(getattr(args, "outlook_max_captcha_retries", None) or cfg.get("max_captcha_retries", 10))
-    timeout = int(getattr(args, "outlook_timeout", None) or cfg.get("timeout_seconds", 900))
-
-    cmd = [
-        sys.executable,
-        "-u",
-        str(script),
-        "--suffix",
-        suffix,
-        "--max-retries",
-        max_retries,
-        "--results-dir",
-        str(results_dir),
-    ]
-    if proxy:
-        cmd.extend(["--proxy", proxy])
-    if getattr(args, "outlook_debug", False) or cfg.get("debug", False):
-        cmd.append("--debug")
-
-    print(f"[*] Outlook register: {script}")
-    completed = subprocess.run(
-        cmd,
-        cwd=str(script.parent),
-        env=_outlook_env(proxy, results_dir=results_dir),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        timeout=timeout if timeout > 0 else None,
-    )
-    if completed.stdout:
-        print(completed.stdout.strip())
-    if completed.stderr:
-        print(completed.stderr.strip())
-    after = _parse_mailbox_password_file(unlogged)
-    new_records = _new_mailbox_records(before, after)
-    if completed.returncode != 0 and not new_records:
-        raise RuntimeError(f"Outlook register failed with exit code {completed.returncode}")
-    if not new_records:
-        raise RuntimeError("Outlook register completed but no new mailbox was written")
-    return new_records[-1]
-
-
-def _run_outlook_oauth(mailbox, args=None, proxy=""):
-    args = args or argparse.Namespace()
-    script = _outlook_script_path(args)
-    if not script.exists():
-        raise FileNotFoundError(f"Outlook register script not found: {script}")
-    cfg = _outlook_register_cfg()
-    email_cfg = _email_cfg()
-    client_id = cfg.get("oauth_client_id") or email_cfg.get("oauth_client_id") or "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
-    redirect_url = cfg.get("oauth_redirect_url") or email_cfg.get("oauth_redirect_url") or "https://login.microsoftonline.com/common/oauth2/nativeclient"
-    scope_value = cfg.get("oauth_scope") or email_cfg.get("oauth_scope") or "offline_access https://graph.microsoft.com/Mail.Read"
-    scopes = [part for part in str(scope_value).replace(",", " ").split() if part]
-    timeout = int(getattr(args, "outlook_oauth_timeout", None) or cfg.get("oauth_timeout_seconds", 120))
-    payload = {
-        "email": mailbox.email,
-        "password": mailbox.password,
-        "proxy": proxy,
-        "client_id": client_id,
-        "redirect_url": redirect_url,
-        "scopes": scopes,
-    }
-    code = (
-        "import json, sys\n"
-        "from camoufox_register import outlook_oauth\n"
-        "payload=json.loads(sys.stdin.read() or '{}')\n"
-        "result=outlook_oauth(email=payload.get('email',''), password=payload.get('password',''), "
-        "proxy=payload.get('proxy',''), client_id=payload.get('client_id',''), "
-        "redirect_url=payload.get('redirect_url',''), scopes=payload.get('scopes') or [])\n"
-        "print(json.dumps(result, ensure_ascii=False), flush=True)\n"
-    )
-    process = subprocess.Popen(
-        [sys.executable, "-u", "-c", code],
-        cwd=str(script.parent),
-        env=_outlook_env(proxy, results_dir=_outlook_results_dir(args)),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        stdout, stderr = process.communicate(json.dumps(payload), timeout=timeout if timeout > 0 else None)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        stdout, stderr = process.communicate()
-        raise RuntimeError(f"Outlook OAuth timed out after {timeout}s")
-    if stderr:
-        print(stderr.strip())
-    try:
-        result = json.loads((stdout or "").strip() or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Outlook OAuth returned invalid JSON: {exc}; stdout={stdout[:500]!r}") from exc
-    if process.returncode != 0:
-        raise RuntimeError(f"Outlook OAuth exited with code {process.returncode}: {result}")
-    if not result.get("success"):
-        raise RuntimeError(str(result.get("error") or result.get("error_message") or "Outlook OAuth failed"))
-    refresh_token = str(result.get("refresh_token") or "").strip()
-    if not refresh_token:
-        raise RuntimeError("Outlook OAuth succeeded but returned no refresh_token")
-    mailbox.refresh_token = refresh_token
-    mailbox.access_token = str(result.get("access_token") or "").strip()
-    mailbox.source = "outlook_batch_register"
-    return mailbox
-
-
-def _append_outlook_token_record(mailbox, results_dir):
-    if not mailbox.refresh_token:
-        return
-    token_file = Path(results_dir) / "outlook_token.txt"
-    token_file.parent.mkdir(parents=True, exist_ok=True)
-    existing = {
-        _record_key(item)
-        for item in _parse_mailbox_token_file(token_file)
-    }
-    if _record_key(mailbox) in existing:
-        return
-    with token_file.open("a", encoding="utf-8") as f:
-        f.write(f"{mailbox.email}---{mailbox.password}---{mailbox.refresh_token}---{mailbox.access_token}---0\n")
-
-
-def _save_mailbox_session_json(mailbox, output_dir, pattern="mailbox_{email}_{timestamp}.json"):
-    if not mailbox.refresh_token:
-        return ""
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    safe_email = re.sub(r"[^a-zA-Z0-9_.@-]+", "_", mailbox.email or "unknown")
-    path = Path(output_dir) / pattern.format(email=safe_email, timestamp=int(time.time()))
-    payload = {
-        "email": mailbox.email,
-        "password": mailbox.password,
-        "refresh_token": mailbox.refresh_token,
-        "access_token": mailbox.access_token,
-        "source": mailbox.source,
-        "created_at": int(time.time()),
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return str(path)
-
-
-def run_outlook_batch(count=1, args=None):
-    args = args or argparse.Namespace()
-    cfg = _outlook_register_cfg()
-    proxy = getattr(args, "proxy", None) or cfg.get("proxy") or CFG.get("proxy", {}).get("default") or ""
-    results_dir = _outlook_results_dir(args)
-    output_dir = getattr(args, "output_dir", None) or cfg.get("output_directory") or str(results_dir)
-    pattern = cfg.get("filename_pattern", "mailbox_{email}_{timestamp}.json")
-    skip_oauth = bool(getattr(args, "outlook_skip_oauth", False) or cfg.get("skip_oauth", False))
-
-    registered = []
-    saved = []
-    failures = []
-    for index in range(max(1, int(count or 1))):
-        print(f"\n{'#' * 40}")
-        print(f"  Outlook mailbox {index + 1}/{count}")
-        print(f"{'#' * 40}")
-        try:
-            mailbox = _run_outlook_register_once(args=args, proxy=proxy)
-            print(f"[*] Outlook mailbox registered: {mailbox.email}")
-            if not skip_oauth:
-                mailbox = _run_outlook_oauth(mailbox, args=args, proxy=proxy)
-                _append_outlook_token_record(mailbox, results_dir)
-                out_path = _save_mailbox_session_json(mailbox, output_dir, pattern=pattern)
-                if out_path:
-                    saved.append(out_path)
-                    print(f"[*] Saved mailbox session: {out_path}")
-            registered.append(mailbox)
-        except Exception as e:
-            print(f"[!] Outlook mailbox failed: {e}")
-            failures.append(str(e))
-    return {
-        "success": bool(registered) and not failures,
-        "registered": len(registered),
-        "saved": len(saved),
-        "failures": failures,
-        "paths": saved,
-    }
 
 
 def _ms_oauth_refresh(mailbox):
@@ -451,8 +423,13 @@ def _message_recipients(msg):
 
 
 def _poll_email_otp(mailbox, subject_keyword="", timeout=300, issued_after_unix=0):
+    if getattr(mailbox, "provider", "") == "luckmail":
+        return _poll_luckmail_otp(mailbox, timeout=timeout)
+    if getattr(mailbox, "provider", "") == "luckmail_token":
+        return _poll_luckmail_token_otp(mailbox, timeout=timeout, issued_after_unix=issued_after_unix)
     keyword = (subject_keyword or "").lower()
     deadline = time.time() + timeout
+    interval = _otp_poll_interval()
     while time.time() < deadline:
         try:
             for msg in _fetch_mailbox_messages(mailbox):
@@ -471,7 +448,70 @@ def _poll_email_otp(mailbox, subject_keyword="", timeout=300, issued_after_unix=
         except Exception as e:
             print(f"[mailbox poll error: {e}]")
         print(".", end="", flush=True)
-        time.sleep(5)
+        time.sleep(interval)
+    print(" timeout")
+    return None
+
+
+def _poll_luckmail_otp(mailbox, timeout=300):
+    deadline = time.time() + timeout
+    interval = _otp_poll_interval()
+    order_no = getattr(mailbox, "order_no", "")
+    if not order_no:
+        raise RuntimeError("LuckMail mailbox missing order_no")
+    while time.time() < deadline:
+        try:
+            data = _luckmail_request("GET", f"/api/v1/openapi/order/{order_no}/code")
+            status = str((data or {}).get("status") or "").lower()
+            code = str((data or {}).get("verification_code") or "").strip()
+            if status == "success" and code:
+                print(f" code:{code}!")
+                return code
+            if status in {"timeout", "cancelled", "canceled"}:
+                print(f" [{status}]")
+                return None
+        except Exception as e:
+            print(f"[luckmail poll error: {e}]")
+        print(".", end="", flush=True)
+        time.sleep(interval)
+    print(" timeout")
+    return None
+
+
+def _luckmail_mail_time(mail):
+    value = str((mail or {}).get("received_at") or "").strip()
+    if not value:
+        return 0
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return int(datetime.strptime(value, fmt).timestamp())
+        except ValueError:
+            pass
+    return 0
+
+
+def _poll_luckmail_token_otp(mailbox, timeout=300, issued_after_unix=0):
+    deadline = time.time() + timeout
+    interval = _otp_poll_interval()
+    seen_message_id = getattr(mailbox, "seen_message_id", "")
+    while time.time() < deadline:
+        try:
+            body = _luckmail_token_code(mailbox)
+            data = body.get("data") or {}
+            code = str(data.get("verification_code") or "").strip()
+            message_id = _latest_luckmail_message_id(data)
+            if code and message_id and message_id != seen_message_id:
+                print(f" code:{code}!")
+                return code
+            if code and not message_id and data.get("has_new_mail"):
+                print(f" code:{code}!")
+                return code
+            if code:
+                print(" old-code", end="", flush=True)
+        except Exception as e:
+            print(f"[luckmail token poll error: {e}]")
+        print(".", end="", flush=True)
+        time.sleep(interval)
     print(" timeout")
     return None
 

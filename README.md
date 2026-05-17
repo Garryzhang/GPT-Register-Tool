@@ -1,92 +1,140 @@
 # GPT-Register-Tool
 
-通过 SMS-Activate 兼容接码平台注册，并只保存成功账号的 session JSON。
+通过邮箱 OTP 完成 ChatGPT 注册，注册成功后访问 `https://chatgpt.com/api/auth/session` 获取 `accessToken`，再调用 `sms_tool/gen_pp_link.py` 生成 ChatGPT Plus PayPal 支付链接，并把结果保存到 session JSON。
 
 ## 环境准备
 
 ```bash
-pip install curl_cffi playwright
+pip install curl_cffi playwright requests
 playwright install chromium
 ```
 
 ## 项目结构
 
 ```text
-chatgpt_phone_reg.py      # 兼容入口，只负责调用 CLI
+chatgpt_phone_reg.py      # 兼容入口，调用 sms_tool.cli
 sms_tool/
   cli.py                  # 命令行参数和输出保存
   config.py               # config.json 加载
-  sms_provider.py         # HeroSMS / SMSBower 接码渠道
-  mailbox.py              # nb-register Outlook 批注册、OAuth、Graph 邮件 OTP
-  registration.py         # ChatGPT 注册主流程
+  paths.py                # sessions/runtime 路径解析
+  mailbox.py              # 邮箱凭据读取、OAuth token 刷新、邮件 OTP 轮询
+  providers/luckmail_token.py  # LuckMail token 直连 OTP API 客户端
+  registration.py         # 邮箱注册、auth session、PayPal 链接固化
+  gen_pp_link.py          # 使用 accessToken 生成 PayPal 支付链接
   utils.py                # 随机数据和步骤计时工具
-SmsWorkbench/
-  App.xaml                # WPF 应用入口与全局样式
-  MainWindow.xaml         # WPF 管理台界面
-  MainWindow.xaml.cs      # 界面逻辑、池状态读取、后端进程调用
-  SmsWorkbench.csproj     # .NET 10 Windows WPF 项目
-  build_dotnet.ps1        # 使用 .NET 10 SDK 发布窗口程序
+SmsWorkbench/             # .NET WPF 管理台
+sessions/                 # 固化后的 session JSON（敏感数据，不提交）
+runtime/                  # Sentinel 等运行时缓存（不提交）
+docs/architecture.md      # 模块职责和维护边界
 ```
 
 ## 配置
 
-复制 `config.example.json` 为 `config.json`，然后配置接码平台。
-
-### 接码渠道
-
-`phone_sms.provider` 支持：
-
-- `herosms`
-- `smsbower`
-
-HeroSMS:
-
-```json
-"phone_sms": {
-  "provider": "herosms",
-  "herosms_api_key": "YOUR_HEROSMS_API_KEY",
-  "service": "dr"
-}
-```
-
-SMSBower:
-
-```json
-"phone_sms": {
-  "provider": "smsbower",
-  "smsbower_api_key": "YOUR_SMSBOWER_API_KEY",
-  "smsbower_base_url": "https://smsbower.page/stubs/handler_api.php",
-  "service": "dr"
-}
-```
-
-`service`、`country`、`max_price`、`min_price`、`blocked_countries` 会用于选号和取号。SMSBower 也会收到 `maxPrice/minPrice` 参数。
+复制 `config.example.json` 为 `config.json`，配置邮箱池或 LuckMail。当前主流程不再使用手机接码。
 
 ### 邮箱对接
 
-当前项目兼容 `nb-register` 的 Outlook token 文件格式：
+默认读取：
+
+```text
+F:\epsoft\GPT-Register-Tool\mailbox_tokens.txt
+```
+
+邮箱 token 文件格式：
 
 ```text
 email---password---refresh_token---access_token---0
 ```
 
-默认读取：
-
-```text
-F:\epsoft\nb-register\outlook-register-service\Results\outlook_token.txt
-```
-
-也可以通过命令行指定：
+也可以直接传入单个邮箱：
 
 ```bash
-python chatgpt_phone_reg.py --mailbox-file F:\path\outlook_token.txt
+python chatgpt_phone_reg.py --email user@example.com --email-password Pass123 --email-refresh-token REFRESH_TOKEN
 ```
 
-如需直接传入单个邮箱：
+也可以传入 LuckMail 已购买邮箱的 token；脚本会直连 LuckMail OpenAPI 解析邮箱地址并读取验证码：
 
 ```bash
-python chatgpt_phone_reg.py --email user@outlook.com --email-password Pass123 --email-refresh-token REFRESH_TOKEN
+python chatgpt_phone_reg.py --luckmail-token tok_xxx --proxy socks5h://127.0.0.1:7897
 ```
+
+一条命令购买 LuckMail 长效 Outlook（微软 IMAP）邮箱并完成注册、PayPal 链接生成、session 固化：
+
+```bash
+python chatgpt_phone_reg.py --buy-luckmail-mailbox --proxy socks5h://127.0.0.1:7897
+```
+
+LuckMail token 对接使用 `GET /api/v1/openapi/email/token/{token}/code` 取验证码，`GET /api/v1/openapi/email/token/{token}/mails` 取最新邮件列表，`GET /api/v1/openapi/email/token/{token}/alive` 检测邮箱。项目只依赖 LuckMail 官方接口。
+
+### LuckMail
+
+如果没有本地邮箱池，且 `email_registration.luckmail_api_key` 已配置，脚本会自动在 LuckMail 创建 `openai` 项目订单，使用返回的邮箱注册，并通过 `order/{order_no}/code` 轮询验证码。
+
+```json
+"email_registration": {
+  "luckmail_api_key": "YOUR_LUCKMAIL_API_KEY",
+  "luckmail_base_url": "https://mails.luckyous.com",
+  "luckmail_project_code": "openai",
+  "luckmail_email_type": "self_built"
+}
+```
+
+## 批量购买注册与 SQLite 索引
+
+批量购买 LuckMail 长效 Outlook 邮箱、逐个注册、生成 PayPal 链接并固化：
+
+```bash
+python chatgpt_phone_reg.py --buy-luckmail-mailbox --count 5 --proxy socks5h://127.0.0.1:7897
+```
+
+该流程会：
+
+1. 调用 LuckMail `email/purchase` 一次性购买 `--count` 个邮箱。
+2. 只注册实际返回的邮箱数量，避免邮箱不足时循环复用同一个邮箱。
+3. 每个成功账号继续获取 `/api/auth/session` 的 `accessToken`，生成 PayPal 链接。
+4. 继续保存 `sessions/session_{email}_{timestamp}.json`。
+5. 同步写入 SQLite 索引 `runtime/accounts.sqlite3`，供 WPF 前端查看、搜索、删除和维护。
+
+从历史 session JSON 重建 SQLite：
+
+```bash
+python chatgpt_phone_reg.py --rebuild-sqlite
+```
+
+### PayPal 链接
+
+`paypal.auto_generate` 默认为 `true`。注册成功并从 `/api/auth/session` 取到 `accessToken` 后，会自动调用：
+
+```python
+from sms_tool.gen_pp_link import generate_pp_link
+```
+
+如需只注册并跳过 PayPal 链接生成：
+
+```bash
+python chatgpt_phone_reg.py --skip-paypal-link
+```
+
+人工支付与 session 刷新：
+
+```bash
+# 展示已保存的 PayPal 链接和状态
+python chatgpt_phone_reg.py --list-paypal-links
+
+# 打开指定账号的 PayPal 链接，由人工在浏览器完成授权或支付
+python chatgpt_phone_reg.py --email user@example.com --open-paypal-link
+
+# 旧链接过期时，重新生成 PayPal 链接并回写 session JSON 和 SQLite
+python chatgpt_phone_reg.py --email user@example.com --regenerate-paypal-link
+
+# 人工支付完成后标记状态
+python chatgpt_phone_reg.py --email user@example.com --mark-paypal-status completed
+
+# 打开可见浏览器，人工完成登录/授权后刷新 session JSON 和 SQLite
+python chatgpt_phone_reg.py --email user@example.com --refresh-session
+```
+
+该流程只打开官方托管支付/登录页面，不在项目内处理 PayPal 开户、短信接码、卡号、日期或 CVV。
 
 ## 使用
 
@@ -94,93 +142,45 @@ python chatgpt_phone_reg.py --email user@outlook.com --email-password Pass123 --
 # 注册 1 个账号
 python chatgpt_phone_reg.py
 
-# 使用 SMSBower 注册
-python chatgpt_phone_reg.py --sms-provider smsbower
-
 # 注册 5 个账号
 python chatgpt_phone_reg.py --count 5
 
-# 指定国家和服务
-python chatgpt_phone_reg.py --country 23 --service ot
+# 指定邮箱池
+python chatgpt_phone_reg.py --mailbox-file F:\path\mailbox_tokens.txt
 
-# 手动提供手机号
-python chatgpt_phone_reg.py --phone +2343000000000 --password MyPass123!A1
-```
-
-### Outlook 邮箱批注册
-
-该入口复用 `F:\epsoft\nb-register\outlook-register-service\camoufox_register.py`，流程为：
-
-1. 注册 Outlook 邮箱，写入 `unlogged_email.txt`
-2. 运行 Microsoft OAuth，获取 `refresh_token/access_token`
-3. 写入 `outlook_token.txt`
-4. 只为带 `refresh_token` 的成功邮箱保存 JSON
-
-```bash
-# 批量注册 5 个 Outlook 邮箱并获取 refresh token
-python chatgpt_phone_reg.py --outlook-register --count 5
-
-# 指定 nb-register 脚本和结果目录
-python chatgpt_phone_reg.py --outlook-register --count 5 ^
-  --outlook-script F:\epsoft\nb-register\outlook-register-service\camoufox_register.py ^
-  --outlook-results-dir F:\epsoft\GPT-Register-Tool\outlook_results
-
-# 只注册邮箱密码，不跑 OAuth
-python chatgpt_phone_reg.py --outlook-register --count 5 --outlook-skip-oauth
-```
-
-OAuth 过程中如果 Microsoft 要求人工邮箱验证码，可在 `config.json` 的 `outlook_register.oauth_verification_code` 或 `outlook_register.oauth_verification_code_file` 中提供。
-
-## Windows 管理台界面
-
-当前仓库包含一个 .NET 10 WPF 管理台，界面参考原型图组织为顶部操作栏、账号池表格、任务队列和底部日志。它不会复制注册逻辑，而是调用现有 Python CLI：
-
-- 批量注册 Outlook：执行 `python chatgpt_phone_reg.py --outlook-register --count N`
-- 批量注册 Free：执行 `python chatgpt_phone_reg.py --count N --sms-provider ...`
-- 邮箱池状态：读取 `outlook_token.txt` 和 `unlogged_email.txt`
-- 号池状态：读取 `session_*.json`
-- 代理出口：从界面输入框传入本次批次的 `--proxy`
-
-编译：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\SmsWorkbench\build_dotnet.ps1
-```
-
-运行：
-
-```powershell
-.\dist\net10\SmsWorkbench.exe
+# 指定代理
+python chatgpt_phone_reg.py --proxy http://user:pass@host:port
 ```
 
 ## 输出
 
-脚本只保存成功注册且带 `refresh_token` 的账号，失败结果不再落盘；如果成功结果里没有 refresh token，会打印提示但不保存文件。输出文件名默认：
+脚本只保存成功注册且带 `access_token` 的账号。输出文件名默认：
 
 ```text
-session_{email}_{timestamp}.json
+sessions/session_{email}_{timestamp}.json
 ```
 
 session JSON 示例：
 
 ```json
 {
-  "email": "user@outlook.com",
-  "phone": "+2343188686716",
+  "email": "user@example.com",
+  "phone": "",
   "password": "Un59hMqqE!A1",
   "session_token": "",
-  "access_token": "",
+  "access_token": "eyJ...",
   "refresh_token": "MAILBOX_REFRESH_TOKEN",
+  "cookie_header": "__Secure-next-auth.session-token=...",
+  "paypal": {
+    "ok": true,
+    "url": "https://www.paypal.com/checkoutnow?token=..."
+  },
   "mailbox": {
-    "email": "user@outlook.com",
+    "email": "user@example.com",
     "password": "MailboxPassword",
     "refresh_token": "MAILBOX_REFRESH_TOKEN",
     "access_token": "MAILBOX_ACCESS_TOKEN",
-    "source": "F:\\epsoft\\nb-register\\outlook-register-service\\Results\\outlook_token.txt"
-  },
-  "sms": {
-    "provider": "smsbower",
-    "activation_id": "379768557"
+    "source": "F:\\epsoft\\GPT-Register-Tool\\mailbox_tokens.txt"
   }
 }
 ```

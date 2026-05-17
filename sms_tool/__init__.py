@@ -1,1 +1,1 @@
-"""Modular ChatGPT/SMS/Outlook registration toolkit."""
+"""Modular ChatGPT mailbox registration and payment-link toolkit."""
